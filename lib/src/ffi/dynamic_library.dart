@@ -1,3 +1,4 @@
+import 'dart:js_interop';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
@@ -12,6 +13,7 @@ import 'memory.dart';
 import 'modules/emscripten_module.dart';
 import 'modules/module.dart';
 import 'modules/standalone_module.dart';
+import 'modules/wasm_pack_module.dart';
 import 'types.dart';
 
 /// An interface for loading module binary.
@@ -20,7 +22,7 @@ mixin ModuleLoader {
   Future<Uint8List> load(String modulePath);
 }
 
-/// Enum for StandaloneWasmModule and EmscriptenModule
+/// Enum for StandaloneWasmModule, EmscriptenModule and WasmPackModule
 enum WasmType {
   /// The module is loaded from a wasm file
   wasm32Standalone,
@@ -29,6 +31,9 @@ enum WasmType {
   /// The module is loaded using emscripten js
   wasm32Emscripten,
   wasm64Emscripten,
+
+  /// The module is loaded using wasm-pack js output
+  wasm32WasmPack,
 }
 
 /// Used on [DynamicLibrary] creation to control if the therby newly created
@@ -87,11 +92,11 @@ class DynamicLibrary {
   /// they are created based on the same module.
   ///
   /// The [wasmType] parameter can be used to control if the module should be
-  /// loaded as standalone wasm module or as emscripten module.
+  /// loaded as standalone wasm module, emscripten module or wasm-pack module.
   ///
-  /// The [moduleName] parameter is only used for debugging purposes. It is
-  /// needed for the [EmscriptenModule] to find the correct module. It is
-  /// ignored for the [StandaloneWasmModule].
+  /// The [moduleName] parameter is primarily used for debugging purposes for
+  /// [EmscriptenModule] to find the correct global module object. It is
+  /// ignored for other module types.
   ///
   /// The [useAsGlobal] parameter can be used to control if the
   /// newly created [Memory] object should be registered as [Memory.global].
@@ -131,11 +136,23 @@ class DynamicLibrary {
     if (wasmType == null) {
       final ext = path.extension(uri.pathSegments.last);
       if (ext == '.js') {
-        wasmType = WasmType.wasm32Emscripten;
+        modulePath = uri.path;
+        final withoutJs = path.withoutExtension(modulePath);
+        final bgWasmExists = await moduleLoader.exists('${withoutJs}_bg.wasm');
+        if (bgWasmExists) {
+          wasmType = WasmType.wasm32WasmPack;
+        } else {
+          wasmType = WasmType.wasm32Emscripten;
+        }
       } else if (ext == '.wasm') {
         wasmType = WasmType.wasm32Standalone;
       } else {
-        if (await moduleLoader.exists('$modulePath.js')) {
+        final jsExists = await moduleLoader.exists('$modulePath.js');
+        final bgJsExists = await moduleLoader.exists('${modulePath}_bg.js');
+        if (jsExists && bgJsExists) {
+          modulePath = '$modulePath.js';
+          wasmType = WasmType.wasm32WasmPack;
+        } else if (jsExists) {
           modulePath = '$modulePath.js';
           wasmType = WasmType.wasm32Emscripten;
         } else if (await moduleLoader.exists('$modulePath.wasm')) {
@@ -148,12 +165,28 @@ class DynamicLibrary {
     }
 
     late Module module;
-    if (wasmType == WasmType.wasm32Emscripten) {
-      await importLibrary(modulePath);
-      module = await EmscriptenModule.compile(moduleName);
-    } else {
-      final wasmBinary = await moduleLoader.load(modulePath);
-      module = await StandaloneWasmModule.compile(wasmBinary);
+    switch (wasmType) {
+      case WasmType.wasm32Standalone:
+        final wasmBinary = await moduleLoader.load(modulePath);
+        module = await StandaloneWasmModule.compile(wasmBinary);
+        break;
+      case WasmType.wasm32Emscripten:
+        await importLibrary(modulePath);
+        module = await EmscriptenModule.compile(moduleName);
+        break;
+      case WasmType.wasm32WasmPack:
+        if (!modulePath.startsWith('http://') &&
+            !modulePath.startsWith('https://') &&
+            !modulePath.startsWith('/')) {
+          // relative imports require a leading ./
+          modulePath = './$modulePath';
+        }
+        final JSAny moduleUrl = modulePath.toJS;
+        final JSObject jsModule = await importModule(moduleUrl).toDart;
+        module = await WasmPackModule.compile(jsModule);
+        break;
+      default:
+        throw ArgumentError('Unsupported wasm type: $wasmType');
     }
 
     final Memory memory = createMemory(module);
